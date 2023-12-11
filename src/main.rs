@@ -1,14 +1,17 @@
 use std::error;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt, copy_bidirectional, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::broadcast::{channel, Receiver, Sender};
+use tokio::try_join;
+use webparse::{BinaryMut, Buf, BufMut};
 
 use crate::Command::UDP;
 
 const SOCKS5_VERSION: u8 = 0x05;
 const RESERVED_CODE: u8 = 0x00;
-
+const BIND_IP:&str = "127.0.0.1";
 
 #[derive(Debug, Copy, Clone)]
 enum ServerReplyType {
@@ -158,8 +161,6 @@ fn validate_credentials(username: &str, password: &str) -> bool {
     username == "user" && password == "password"
 }
 
-
-
 async fn handle_method_password(stream: &mut TcpStream) -> io::Result<()> {
     // 发送确认使用用户名/密码认证的响应
     new_server_auth_message(stream, Method::MethodPassword).await?;
@@ -197,6 +198,7 @@ async fn handle_method_password(stream: &mut TcpStream) -> io::Result<()> {
     Ok(())
 }
 
+
 async fn auth(stream: &mut TcpStream, message: &[u8]) -> io::Result<()> {
     let auth_message = new_client_auth_message(message)?;
     println!("认证信息: {:?}", auth_message);
@@ -224,6 +226,7 @@ async fn auth(stream: &mut TcpStream, message: &[u8]) -> io::Result<()> {
 
     Err(io::Error::new(io::ErrorKind::Other, "不支持认证方式"))
 }
+
 
 
 fn new_client_request_message(message: &[u8]) -> io::Result<ClientRequestMessage> {
@@ -336,6 +339,7 @@ async fn request(stream: &mut TcpStream, message: &[u8]) -> io::Result<Socket> {
             return Err(e);
         }
     };
+
     match result.cmd {
         Command::CONNECT => {
             let addr = result.address.to_string(); // 确保地址是正确的字符串格式
@@ -354,11 +358,27 @@ async fn request(stream: &mut TcpStream, message: &[u8]) -> io::Result<Socket> {
             new_server_request_failure_message(stream, ServerReplyType::CommandNotSupported).await?;
             Err(io::Error::new(io::ErrorKind::InvalidInput, "不支持bind连接命令"))
         }
+
         Command::UDP => {
+            // 提供一个服务器上的 UDP 端口和 IP 地址
+            // let addr = result.address.to_string();
+            // if addr.is_empty() {
+            //     return Err(ProxyError::ProtNoSupport);
+            // }
+            // 执行 UDP ASSOCIATE 命令
+            // udp_execute_assoc(stream, Ipv4Addr::new(127, 0, 0, 1)).await?;
+            // Ok(Socket::Udp());
+
             match UdpSocket::bind("0.0.0.0:0").await {
-                Ok(socket) => {
-                    new_server_request_success_message(stream, &result.address, result.port).await?;
-                    Ok(Socket::Udp(socket))
+                Ok(peer_sock) => {
+                    let port = peer_sock.local_addr()?.port();
+                    // bind_ip 代表代理服务器将要告诉客户端用于 UDP 通信的 IP 地址
+
+                    let mut buf = BinaryMut::with_capacity(100);
+                    buf.put_slice(&vec![SOCKS5_VERSION, if succ { 0 } else { 1 }, 0x00]);
+
+                    stream.write_all(&buf.chunk()).await?;
+                    Ok(Socket::Udp(peer_sock))
                 }
                 Err(_) => {
                     new_server_request_failure_message(stream, ServerReplyType::CommandNotSupported).await?;
@@ -369,25 +389,195 @@ async fn request(stream: &mut TcpStream, message: &[u8]) -> io::Result<Socket> {
     }
 }
 
+// UDP 关联请求用于在UDP中继进程内建立关联以处理UDP数据报。
+// DST.ADDR和DST.PORT字段包含客户端期望用于发送UDP数据报的地址和端口。
+// 服务器可以使用此信息来限制对关联的访问。如果客户端在UDP 关联请求时没有掌握此信息，
+// 客户端必须使用端口号和地址都为零的地址。
+// UDP关联会在随着的TCP连接终止时终止。
+// 在UDP 关联请求的回复中，BND.PORT和BND.ADDR字段指示客户端必须发送UDP请求消息以进行中继的端口号/地址。
+// UDP 数据包保留字段（0x00 0x00），FRAG 字段（通常为0x00），ATYP 字段（地址类型，IPv4/IPv6/域名），DST.ADDR（目的地址），DST.PORT（目的端口），以及实际的 UDP 数据负载
+// bind_ip 是用于告诉客户端向哪里发送数据包的地址，
+// UdpSocket::bind("0.0.0.0:0") 是代理服务器实际上用于接收和转发这些数据包的网络端点
+pub async fn udp_execute_assoc(bind_ip: Ipv4Addr)->io::Result<()>{
+    // 代理服务器创建一个新的 UDP 套接字，并绑定到任意可用的地址和端口
+    let peer_sock = UdpSocket::bind("0.0.0.0:0").await?;
+    // 查询 UDP 套接字绑定的本地地址，并获取其端口号
+    let port = peer_sock.local_addr()?.port();
 
-async fn forward(source: &mut TcpStream,dest:Socket)->io::Result<()>{
+    // 代理服务器通过 TCP 连接向客户端发送响应，通知客户端其 UDP 套接字的绑定地址（bind_ip）和端口（port）
+    // new_server_request_success_message(stream, &Address::IpV4(bind_ip),port).await?;
+    // // 启动 UDP 数据转发  inbound 用于接受，outbound 用于发送 UDP 数据
+    // udp_transfer(stream, peer_sock).await?;
+    Ok(())
+}
+
+async fn udp_transfer(stream:&mut TcpStream, inbound: UdpSocket)->io::Result<()>{
+    let outbound = UdpSocket::bind("0.0.0.0:0").await?;
+    // 使tcp断开的时候通知udp结束关联,结束处理函数
+    let (sender, receiver) = channel::<()>(1);
+    // 一个套接字用于与客户端通信（接收客户端的数据并发送数据给客户端），另一个套接字用于与外部服务器或目的地通信。
+    // in 客户端想通过代理服务器发送 UDP 数据， out 通过代理服务器将客户端的请求转发到最终的目的地
+    // 处理upd的接收
+    let req_fut =  udp_handle_request(&inbound, &outbound, receiver);
+    // 处理upd的发送
+    let res_fut =  udp_handle_response(&inbound, &outbound, sender.subscribe());
+    // tcp连接
+    let tcp_fut =  upd_handle_tcp_block(stream, sender.subscribe(), sender.clone());
+    match try_join!(tcp_fut, req_fut, res_fut) {
+        Ok(_) => {}
+        Err(error) => {
+            // 发生错误时不确定是哪个处理函数出错, 通知其它的停止
+            let _ = sender.send(());
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+
+///   +----+------+------+----------+----------+----------+
+///   |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+///   +----+------+------+----------+----------+----------+
+///   | 2  |  1   |  1   | Variable |    2     | Variable |
+///   +----+------+------+----------+----------+----------+
+///  UDP和本地的通讯的头全部加上这个，因为中间隔了代理，需要转发到正确的地址上
+async fn udp_parse_request(buf: &mut BinaryMut) -> io::Result<(u8, SocketAddr)> {
+    if buf.remaining() < 3 {
+        return Err(io::Error::new(io::ErrorKind::Other, "无法连接到目标地址"));
+    }
+    let _rsv = buf.get_u16();
+    let flag = buf.get_u8();
+    let array: Vec<u8> = vec![];
+    let addr =SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+    return Ok((flag, addr));
+}
+
+/// +------+----------+----------+
+/// | ATYP | DST.ADDR | DST.PORT |
+/// +------+----------+----------+
+/// |  1   | Variable |    2     |
+/// +------+----------+----------+
+/// 读取通用地址格式，包含V4/V6/Doamin三种格式
+
+async fn upd_handle_tcp_block(stream: &mut TcpStream, mut receiver: Receiver<()>, sender: Sender<()>,)->io::Result<()>{
+    let mut buf = [0u8; 100];
+    loop {
+        let n = tokio::select! {
+                r = stream.read(&mut buf) => {
+                    r?
+                },
+                _ = receiver.recv() => {
+                    return Ok(());
+                }
+            };
+        if n == 0 {
+            let _ = sender.send(());
+            return Ok(());
+        }
+    }
+}
+
+// 处理收到客户端的消息, 解析发送到远程
+async fn udp_handle_request(inbound: &UdpSocket, outbound: &UdpSocket, mut receiver: Receiver<()>, ) -> io::Result<()> {
+    let mut buf = BinaryMut::with_capacity(0x10000);
+    loop {
+        buf.clear();
+        let (size, client_addr) = {
+            let mut buf = ReadBuf::uninit(buf.chunk_mut());
+            tokio::select! {
+                    r = inbound.recv_buf_from(&mut buf) => {
+                        r?
+                    },
+                    _ = receiver.recv() => {
+                        return Ok(());
+                    }
+                }
+        };
+        unsafe {
+            buf.advance_mut(size);
+        }
+        // 代理对内的端口只会跟客户端的通讯, 所以建立connect
+        inbound.connect(client_addr).await?;
+
+        let (flag, addr) = udp_parse_request(&mut buf).await?;
+        if flag != 0 {
+            return Ok(());
+        }
+
+        outbound.send_to(buf.chunk(), addr).await?;
+    }
+}
+
+/// 处理收到远程的消息, 添加头发送到客户端
+async fn udp_handle_response(inbound: &UdpSocket, outbound: &UdpSocket, mut receiver: Receiver<()>, ) -> io::Result<()>{
+    let mut buf = BinaryMut::with_capacity(0x10000);
+    loop {
+        buf.clear();
+        let (size, client_addr) = {
+            let (size, client_addr) = {
+                let mut buf = ReadBuf::uninit(buf.chunk_mut());
+                tokio::select! {
+                        r = outbound.recv_buf_from(&mut buf) => {
+                            r?
+                        },
+                        _ = receiver.recv() => {
+                            return Ok(());
+                        }
+                    }
+            };
+            (size, client_addr)
+        };
+        unsafe {
+            buf.advance_mut(size);
+        }
+
+        let mut buffer = BinaryMut::with_capacity(100);
+        buffer.put_slice(&[0, 0, 0]);
+        encode_socket_addr(&mut buffer, &client_addr)?;
+        buffer.put_slice(buf.chunk());
+
+        // 因为已经建立了绑定, 所以直接发送
+        inbound.send(buffer.chunk()).await?;
+    }
+}
+/// +------+----------+----------+
+/// | ATYP | DST.ADDR | DST.PORT |
+/// +------+----------+----------+
+/// |  1   | Variable |    2     |
+/// +------+----------+----------+
+/// 将地址转化成二进制流
+pub fn encode_socket_addr(buf: &mut BinaryMut, addr: &SocketAddr) -> io::Result<()> {
+    let (addr_type, mut ip_oct, mut port) = match addr {
+        SocketAddr::V4(sock) => (
+            0x01,
+            sock.ip().octets().to_vec(),
+            sock.port().to_be_bytes().to_vec(),
+        ),
+        SocketAddr::V6(sock) => (
+            0x04,
+            sock.ip().octets().to_vec(),
+            sock.port().to_be_bytes().to_vec(),
+        ),
+    };
+
+    buf.put_u8(addr_type);
+    buf.put_slice(&mut ip_oct);
+    buf.put_slice(&mut port);
+    Ok(())
+}
+
+
+async fn forward(source: &mut TcpStream,dest:Socket)->io::Result<()> {
     match dest {
         Socket::Tcp(mut dest_stream) => {
             // 转发过程
-            let (mut ri, mut wi) = source.split();
-            let (mut ro, mut wo) = dest_stream.split();
-            let client_to_server = tokio::io::copy(&mut ri, &mut wo);
-            let server_to_client = tokio::io::copy(&mut ro, &mut wi);
-
-            match tokio::try_join!(client_to_server, server_to_client) {
-                Ok((_, _)) => Ok(()),
-                Err(e) => Err(e),
-            }
+            let _ = copy_bidirectional(source, &mut dest_stream).await?;
         }
-        Socket::Udp(_) => {
+        Socket::Udp(Address) => {
             unimplemented!()
         }
     }
+    Ok(())
 }
 
 
