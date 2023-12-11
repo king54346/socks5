@@ -38,6 +38,25 @@ SOCKS版本（0x05，表示SOCKS5）
     
 
 
+
+内网穿透， 将内网的服务映射到公网上去
+
+公网服务器                  内网服务器
+             <--建立连接 
+                 
+             主动打开tcp-->
+
+              <-- 建立tcp连接
+
+              <--双向连接-->
+
+
+
 https://github.com/search?q=RingBuf%3A%3Awith_byte_size&type=code
 https://zhuanlan.zhihu.com/p/644885061
 https://github.com/vadorovsky/aya-examples
+https://www.jianshu.com/p/97873541510f
+https://blog.upx8.com/3146
+https://github.com/pysrc/portmap/blob/main/pmap.go
+https://www.zhihu.com/people/wmproxy
+https://github.com/tickbh/wmproxy/blob/main/src/socks5.rs

@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
+webparse = { version = "0.2.0"}
+tokio-util = "0.7"
 
 [source.crates-io]
 replace-with = 'ustc'
