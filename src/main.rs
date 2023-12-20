@@ -1,9 +1,5 @@
 use std::error;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-
-mod proto;
-mod mapping;
-
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt, copy_bidirectional, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::broadcast::{channel, Receiver, Sender};
