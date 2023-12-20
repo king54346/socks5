@@ -1,13 +1,14 @@
 use std::error;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+mod proto;
+mod mapping;
+
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt, copy_bidirectional, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::broadcast::{channel, Receiver, Sender};
 use tokio::try_join;
 use webparse::{BinaryMut, Buf, BufMut};
-
-use crate::Command::UDP;
 
 const SOCKS5_VERSION: u8 = 0x05;
 const RESERVED_CODE: u8 = 0x00;
@@ -135,7 +136,6 @@ fn new_client_auth_message(message: &[u8]) -> io::Result<ClientAuthMessage> {
     if message.len() < 2 + nmethod {
         return Err(io::Error::new(io::ErrorKind::Other, "缓冲区长度不匹配"));
     }
-
     let methods = message[2..2 + nmethod]
         .iter()
         .map(|&byte| Method::from(byte))
@@ -324,6 +324,36 @@ async fn new_server_request_success_message(stream: &mut TcpStream, address: &Ad
     Ok(())
 }
 
+
+async fn new_udp_associate(stream: &mut TcpStream, bind_ip: IpAddr, port: u16) -> io::Result<()>{
+    let mut response = Vec::new();
+    response.push(SOCKS5_VERSION);
+    response.push(ServerReplyType::Success.into());
+    response.push(RESERVED_CODE);
+
+    let (addr_type, ip_oct) = match bind_ip {
+        IpAddr::V4(addr) => (
+            0x01,
+            addr.octets().to_vec(),
+        ),
+        IpAddr::V6(addr) => (
+            0x04,
+            addr.octets().to_vec(),
+        ),
+    };
+
+    response.push(addr_type);
+    response.extend_from_slice(&ip_oct);
+    response.extend_from_slice(&port.to_be_bytes()); // 端口号（大端表示）
+    // 发送响应消息
+    stream.write_all(&response).await?;
+
+    Ok(())
+}
+
+
+
+
 async fn new_server_request_failure_message(stream: &mut TcpStream, srt: ServerReplyType) -> io::Result<()> {
     stream.write_all(&[SOCKS5_VERSION, srt.into(), RESERVED_CODE, 0x01, 0, 0, 0, 0, 0, 0]).await?;
     Ok(())
@@ -368,16 +398,13 @@ async fn request(stream: &mut TcpStream, message: &[u8]) -> io::Result<Socket> {
             // 执行 UDP ASSOCIATE 命令
             // udp_execute_assoc(stream, Ipv4Addr::new(127, 0, 0, 1)).await?;
             // Ok(Socket::Udp());
-
+            //  udpassoc
             match UdpSocket::bind("0.0.0.0:0").await {
                 Ok(peer_sock) => {
                     let port = peer_sock.local_addr()?.port();
                     // bind_ip 代表代理服务器将要告诉客户端用于 UDP 通信的 IP 地址
-
-                    let mut buf = BinaryMut::with_capacity(100);
-                    buf.put_slice(&vec![SOCKS5_VERSION, if succ { 0 } else { 1 }, 0x00]);
-
-                    stream.write_all(&buf.chunk()).await?;
+                    // bind_ip.unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+                    new_udp_associate(stream,  IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port).await?;
                     Ok(Socket::Udp(peer_sock))
                 }
                 Err(_) => {
@@ -417,6 +444,7 @@ async fn udp_transfer(stream:&mut TcpStream, inbound: UdpSocket)->io::Result<()>
     let (sender, receiver) = channel::<()>(1);
     // 一个套接字用于与客户端通信（接收客户端的数据并发送数据给客户端），另一个套接字用于与外部服务器或目的地通信。
     // in 客户端想通过代理服务器发送 UDP 数据， out 通过代理服务器将客户端的请求转发到最终的目的地
+
     // 处理upd的接收
     let req_fut =  udp_handle_request(&inbound, &outbound, receiver);
     // 处理upd的发送
@@ -424,11 +452,15 @@ async fn udp_transfer(stream:&mut TcpStream, inbound: UdpSocket)->io::Result<()>
     // tcp连接
     let tcp_fut =  upd_handle_tcp_block(stream, sender.subscribe(), sender.clone());
     match try_join!(tcp_fut, req_fut, res_fut) {
-        Ok(_) => {}
+        Ok(_) => {
+
+        }
         Err(error) => {
             // 发生错误时不确定是哪个处理函数出错, 通知其它的停止
             let _ = sender.send(());
+            println!("END");
             return Err(error);
+            
         }
     }
     Ok(())
@@ -448,6 +480,7 @@ async fn udp_parse_request(buf: &mut BinaryMut) -> io::Result<(u8, SocketAddr)> 
     let _rsv = buf.get_u16();
     let flag = buf.get_u8();
     let array: Vec<u8> = vec![];
+    // 真实的upd服务
     let addr =SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
     return Ok((flag, addr));
 }
@@ -499,11 +532,13 @@ async fn udp_handle_request(inbound: &UdpSocket, outbound: &UdpSocket, mut recei
         // 代理对内的端口只会跟客户端的通讯, 所以建立connect
         inbound.connect(client_addr).await?;
 
+    
         let (flag, addr) = udp_parse_request(&mut buf).await?;
+    
         if flag != 0 {
             return Ok(());
         }
-
+        // 发送
         outbound.send_to(buf.chunk(), addr).await?;
     }
 }
@@ -535,11 +570,12 @@ async fn udp_handle_response(inbound: &UdpSocket, outbound: &UdpSocket, mut rece
         buffer.put_slice(&[0, 0, 0]);
         encode_socket_addr(&mut buffer, &client_addr)?;
         buffer.put_slice(buf.chunk());
-
         // 因为已经建立了绑定, 所以直接发送
         inbound.send(buffer.chunk()).await?;
     }
 }
+
+
 /// +------+----------+----------+
 /// | ATYP | DST.ADDR | DST.PORT |
 /// +------+----------+----------+
@@ -574,7 +610,22 @@ async fn forward(source: &mut TcpStream,dest:Socket)->io::Result<()> {
             let _ = copy_bidirectional(source, &mut dest_stream).await?;
         }
         Socket::Udp(Address) => {
-            unimplemented!()
+            // Udp转发过程 格式
+            // 保留：占用2个字节，必须为0x00 0x00。
+            // 片段编号：占用1个字节。对于UDP数据包的分片处理，通常这个值为0x00，表示不进行分片。
+            // 地址类型：占用1个字节。指定目标地址的类型，可能的值包括：
+            // 0x01：IPv4地址（4个字节）。
+            // 0x03：域名（首字节为域名长度，后跟域名的实际字节）。
+            // 0x04：IPv6地址（16个字节）。
+            // 目的地址：根据地址类型的不同，长度可变。这是数据包应该被转发到的最终目标地址。
+            // 目的端口：占用2个字节，表示数据包应该发送到的目标端口。
+            // 数据：跟随在地址和端口信息后面的是实际的UDP负载数据。
+            udp_transfer(source, Address).await?;
+
+
+           // 客户端发送UDP数据包  发送到之前UDP ASSOCIATE命令响应中指定的代理服务器地址和端口
+           // 代理服务器处理数据包  代理服务器接收到这个封装了UDP负载的SOCKS5请求后，会解析出目标地址和端口，并将UDP负载部分转发到该目的地
+           // 接收回复             如果目的地有响应数据包返回，代理服务器会按照同样的格式封装这些UDP数据，并发送回客户端。
         }
     }
     Ok(())
@@ -600,7 +651,6 @@ async fn handle_client(mut stream: TcpStream) -> io::Result<()> {
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:1081").await?;
-
     loop {
         let (stream, _) = listener.accept().await?;
         tokio::spawn(async move {
@@ -609,4 +659,5 @@ async fn main() -> io::Result<()> {
             }
         });
     }
+    
 }
